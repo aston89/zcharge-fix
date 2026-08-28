@@ -3,58 +3,111 @@
 
 Simple module to limit charging capacity. This is my experiment coding in C++, jump straight using chatgpt, pretty fun.
 
-
 ## Fork changes
 
 This is a fork of [lululoid/zcharge](https://github.com/lululoid/zcharge).
 
+The fork mainly fixes charging-state handling on Qualcomm devices and removes
+unnecessary polling overhead.
+
 ### Why these changes?
 
 - **Main loop: 1s → 60s**
-  - Polling every second was pointless for a charge limiter and caused unnecessary
-    wakeups / overhead.
-  - 60 seconds is enough for capacity-based charging control.
+  - Polling battery state every second is unnecessary for a charge limiter.
+  - The normal monitoring loop now runs once per minute.
+  - The 1-second polling is retained only while confirming a charging
+    switch transition.
 
-- **USB detection via `usb/online`**
-  - The original logic relied on `battery/status`.
-  - On Qualcomm devices, disabling charging through `input_suspend` makes Android
-    report `Discharging` even when the USB cable is still connected.
-  - This made zcharge think the charger had been unplugged and prevented proper
-    recharging.
+- **USB presence via `usb/online`**
+  - The original implementation relied on `battery/status` to determine
+    whether the charger was still connected.
+  - On Qualcomm devices, `input_suspend=1` makes the battery report
+    `Discharging` even though USB is still physically connected.
+  - The fork checks the actual USB power-supply state instead.
 
-- **`is_charging()` no longer uses `battery/status`**
-  - Same problem: `battery/status` becomes misleading when `input_suspend=1`.
-  - The actual battery current is a much better indication of whether charge is
-    flowing.
+- **Charging detection via actual battery current**
+  - `battery/status` is unreliable while charging is suspended.
+  - `battery/current_now` is used to determine whether current is actually
+    flowing into the battery.
 
-- **Recharging logic fixed**
-  - With the old logic, reaching the charge limit could leave charging suspended
-    indefinitely because the device appeared to be "unplugged".
-  - Now zcharge can correctly go:
-    `50% → stop → 48% → resume`
-    while the USB charger remains connected.
+- **Fixed recharge hysteresis**
+  - The intended behaviour is:
+    `50% → stop charging → 48% → resume charging`
+  - Recharging no longer depends on the misleading `battery/status` state
+    produced by `input_suspend`.
 
-- **Temperature recovery cannot bypass the charge limit**
-  - We don't want temperature control to accidentally restart charging above the
-    configured capacity limit.
-  - Temperature recovery can therefore only restart charging when
-    `capacity < capacity_limit`.
+- **Temperature recovery cannot override the capacity limit**
+  - Recovering from a thermal cooldown must not restart charging above
+    `capacity_limit`.
 
 - **Charging-switch verification rewritten**
-  - The old code changed its internal switch state and then used that same state
-    to decide whether the transition had succeeded.
-  - That could make the check succeed/fail for the wrong reason.
-  - The new code checks `battery/current_now` directly.
+  - The fork verifies the result using actual battery current instead of
+    relying only on the software switch state.
 
-- **1-second checks kept only during switch transitions**
-  - Turning charging on/off is something we actually want to verify quickly.
-  - So the 1-second polling wasn't removed completely, just moved out of the normal
-    monitoring loop.
+- **Current units corrected in logging**
+  - Android exposes `battery/current_now` in µA.
+  - Logs therefore report the value as `µA` rather than `mA`.
 
-- **Current logging fixed**
-  - `current_now` is reported by the kernel in µA, while the original log labelled
-    it as mA.
-  - A value like `1500000` therefore means about `1.5 A`, not `1500 A`.
+### Build system
+
+The repository contains a small helper build pipeline because the source is
+also edited from Windows.
+
+- `A1_make_configure_sqliteDB.py`
+  - Creates a backup of `zcharge.db`.
+  - Applies the intended default configuration.
+  - Ensures the required SQLite configuration keys exist.
+
+- `A2_make_magisk_module.py`
+  - Collects the compiled binary and Magisk module files.
+  - Creates the final `zcharge-magisk.zip`.
+
+- `Makefile`
+  - Builds `system/bin/zcharge`.
+  - Links the bundled SQLite amalgamation.
+  - Expects an Android ARM64 toolchain and the corresponding `libc++_shared.so`.
+
+- `.github/workflows/`
+  - The project is compiled through GitHub Actions instead of requiring a
+    local Android NDK installation.
+  - The workflow installs the Android NDK, builds the ARM64 binary, verifies
+    the resulting ELF, and uploads the compiled binary as an artifact.
+
+### Windows source sanitization
+
+When the source is copied/edited from Windows, line endings and file encoding
+can occasionally cause confusing compiler/parser failures.
+
+The build workflow therefore treats the repository contents as source files
+rather than assuming that a Windows copy/paste is already clean.
+
+The helper scripts are intentionally kept separate from the C++ source so that
+database configuration and Magisk packaging can be repeated without touching
+the compiled code.
+
+### Build flow
+
+```text
+zcharge.cpp
+    │
+    ▼
+GitHub Actions
+    │
+    ├── Android NDK / ARM64 toolchain
+    │
+    ▼
+make
+    │
+    ▼
+system/bin/zcharge
+    │
+    ├── A1_make_configure_sqliteDB.py
+    │
+    └── A2_make_magisk_module.py
+            │
+            ▼
+    zcharge-magisk.zip
+````
 
 ---
 
