@@ -47,40 +47,33 @@ jobs:
 
           echo "ANDROID_NDK_HOME=$HOME/android-sdk/ndk/26.3.11579264" >> "$GITHUB_ENV"
 
-      - name: Prepare Android compiler
+      - name: Prepare Android toolchain
         run: |
-          TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          NDK="$ANDROID_NDK_HOME"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
 
           mkdir -p "$HOME/android-prefix/aarch64-linux-android/lib"
 
-          # Makefile expects this exact library path.
+          # Il Makefile verifica esplicitamente che questa libreria esista.
           cp "$TOOLCHAIN/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
              "$HOME/android-prefix/aarch64-linux-android/lib/"
 
-          # Make the Android cross-compiler available as "g++",
-          # because the repository Makefile hardcodes CC = g++.
-          ln -sf \
-            "$TOOLCHAIN/bin/aarch64-linux-android24-clang++" \
-            "$HOME/android-prefix/g++"
-
-          echo "$HOME/android-prefix" >> "$GITHUB_PATH"
           echo "PREFIX=$HOME/android-prefix" >> "$GITHUB_ENV"
+          echo "TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
 
-          echo "Compiler:"
-          "$HOME/android-prefix/g++" --version
-
-          echo
-          echo "PREFIX:"
-          echo "$PREFIX"
+          echo "Android compiler:"
+          "$TOOLCHAIN/bin/aarch64-linux-android24-clang++" --version
 
           echo
           echo "libc++:"
-          ls -l "$PREFIX/aarch64-linux-android/lib/libc++_shared.so"
+          ls -l "$HOME/android-prefix/aarch64-linux-android/lib/libc++_shared.so"
 
       - name: Build zcharge
         run: |
           make clean
-          make
+
+          make \
+            CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
 
       - name: Verify binary
         run: |
@@ -92,7 +85,7 @@ jobs:
           readelf -h system/bin/zcharge | grep -E 'Class|Machine'
 
           echo
-          echo "zcharge string:"
+          echo "Waiting string:"
           strings system/bin/zcharge | grep -F "Waiting" || true
 
       - name: Upload compiled binary
