@@ -1,6 +1,6 @@
-id=zcharge
-name=zcharge
-version=v0.9-alpha
-versionCode=383
-author=lululoid
-description=To limit charging capacity
+id=Zcharge
+name=zcharge-fix
+version=v0.9-alpha-fix
+versionCode=384
+author=lululoid / aston89
+description=Fork of lululoid/zcharge with Qualcomm charging-state fixes, reduced polling overhead and charging hysteresis fixes.
