@@ -54,7 +54,6 @@ jobs:
 
           mkdir -p "$HOME/android-prefix/aarch64-linux-android/lib"
 
-          # Il Makefile verifica esplicitamente che questa libreria esista.
           cp "$TOOLCHAIN/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
              "$HOME/android-prefix/aarch64-linux-android/lib/"
 
@@ -73,7 +72,8 @@ jobs:
           make clean
 
           make \
-            CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
+            CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++" \
+            CFLAGS="-I$(pwd)/sqlite-amalgamation -static-libgcc -static-libstdc++"
 
       - name: Verify binary
         run: |
