@@ -1,237 +1,126 @@
-# zcharge-fix
+# zcharge
 
-A bug-fix fork of [lululoid/zcharge](https://github.com/lululoid/zcharge), a small Android/Qualcomm charging limiter written in C++.
+Simple Magisk module to limit battery charging capacity.
 
-The original project already provides the core idea: limit battery charging to a configured capacity and control charging through a kernel charging-switch interface.
+This repository is a fork of [lululoid/zcharge](https://github.com/lululoid/zcharge), with a number of bugfixes and behavioral changes made to make the limiter reliable on Qualcomm devices, especially when charging is suspended through `input_suspend`.
 
-This fork focuses on fixing the charging-state logic on Qualcomm devices and reducing unnecessary background polling.
+The original project is a C++ charging-limiter experiment. This fork keeps the original architecture, SQLite configuration and notification system, but changes the charging-state logic substantially.
 
-> **Target:** Qualcomm / Android devices using `/sys/class/qcom-battery/input_suspend`.
+## Fork changes
 
----
+This is a fork of **lululoid/zcharge**.
 
-## What changed
+### Why these changes?
 
-### 1. Main polling loop: 1 second → 60 seconds
+The original logic mixed together:
 
-The original implementation runs its main monitoring loop once every second.
+* battery charge state
+* USB connection state
+* `battery/status`
+* battery current
+* charging switch state
 
-For a charging-capacity limiter this is unnecessarily aggressive: battery percentage does not need to be polled every second, and constantly waking a background process is pointless overhead.
-
-The fork changes the normal monitoring interval to:
-
-```cpp
-constexpr int MAIN_LOOP_INTERVAL_SECONDS = 60;
-```
-
-Normal battery/USB monitoring therefore happens once per minute.
-
-The 1-second interval is **not completely removed**: it is still used while confirming an actual charging-switch transition.
-
-This gives us:
-
-```text
-normal monitoring
-        ↓
-      every 60 s
-
-charging ON/OFF transition
-        ↓
-   verify every 1 s
-```
-
-The idea is simple: sleep most of the time, react quickly only when a charging state is actively being changed.
-
----
-
-### 2. USB presence is now detected from `usb/online`
-
-The original logic inferred charger presence from:
-
-```text
-/sys/class/power_supply/battery/status
-```
-
-This is problematic on Qualcomm devices when charging is suspended through:
+On Qualcomm devices this becomes problematic because suspending charging through:
 
 ```text
 /sys/class/qcom-battery/input_suspend
 ```
 
-With:
+can make Android report:
 
 ```text
-input_suspend = 1
+battery/status = Discharging
 ```
 
-the battery can report:
+even while the USB charger is physically connected.
+
+That means `battery/status` cannot reliably be used to decide whether the charger is connected or whether zcharge should resume charging.
+
+This fork therefore simplifies the controller and makes `input_suspend` the actual charging switch.
+
+---
+
+## 1. Main monitoring loop reduced from 1 second to 60 seconds
+
+The original limiter polled continuously every second.
+
+This was unnecessary for capacity-based charging control and caused needless wakeups.
+
+The normal monitoring loop now runs every:
 
 ```text
-Discharging
+60 seconds
 ```
 
-even though the USB cable is still physically connected and the USB power source is still present.
+This is more than sufficient for a battery capacity limiter.
 
-That confused the original state machine.
+The fast polling behavior has **not** been completely removed: short 1-second checks are still used when verifying an actual charging-switch transition.
 
-The fork therefore reads:
+---
+
+## 2. USB detection removed from the charging controller
+
+The fork originally experimented with `usb/online` as an additional charger-presence signal.
+
+That logic has now been removed from the limiter entirely.
+
+zCharge does **not** need to determine:
+
+> "Is the USB charger physically connected?"
+
+The Android/Qualcomm power stack already knows whether the device can charge.
+
+The limiter only needs to control:
+
+```text
+/sys/class/qcom-battery/input_suspend
+```
+
+Therefore the charging logic no longer depends on:
 
 ```text
 /sys/class/power_supply/usb/online
 ```
 
-instead.
-
-Conceptually:
+or:
 
 ```text
-USB cable physically present
-        ↓
-usb/online = 1
+/sys/class/power_supply/battery/status
 ```
 
-is now the definition of **charger present**.
-
-This is independent of whether charging is currently suspended.
+This also means a USB disconnect/reconnect cannot be used as the state machine for deciding whether charging should resume.
 
 ---
 
-### 3. `battery/status` is no longer used to decide whether current is flowing
+## 3. `battery/status` is no longer used to determine charging state
 
-The original implementation combined the Android battery status with the charging-switch state to determine whether charging was actually occurring.
-
-That becomes unreliable once `input_suspend` is involved.
-
-The fork instead uses the actual battery current:
+On the target Qualcomm setup, when:
 
 ```text
-/sys/class/power_supply/battery/current_now
-```
-
-The relevant distinction is:
-
-```text
-current_now < 0
-    ↓
-current is flowing into the battery
-    ↓
-charging
-
-current_now >= 0
-    ↓
-battery is not being charged
-```
-
-This makes the charging decision based on the electrical state reported by the power-supply driver rather than on the higher-level `battery/status` string.
-
----
-
-### 4. Recharging hysteresis was fixed
-
-The intended behaviour of the limiter is:
-
-```text
-50%
- ↓
-stop charging
- ↓
-battery falls
- ↓
-48%
- ↓
-resume charging
-```
-
-The original state machine could fail here because after `input_suspend` was enabled the battery could report `Discharging`, causing the software to interpret the situation as if the charger had disappeared.
-
-The fork separates:
-
-```text
-"Is a USB charger connected?"
-```
-
-from:
-
-```text
-"Is the battery currently being charged?"
-```
-
-so the system can remain:
-
-```text
-usb/online = 1
 input_suspend = 1
+```
+
+Android may report:
+
+```text
 battery/status = Discharging
 ```
 
-while correctly understanding that the charger is still connected and charging can later be resumed.
+even though:
+
+```text
+USB = connected
+```
+
+That behavior makes `battery/status` unsuitable as the primary charging-state signal.
+
+The fork therefore does not use it to drive the limiter.
 
 ---
 
-### 5. Capacity recovery no longer depends on `battery/status`
+## 4. `input_suspend` is now the source of truth
 
-Once charging has been suspended, the battery may legitimately report `Discharging`.
-
-Therefore the recharge condition is based on:
-
-```text
-USB charger present
-+
-capacity below recharging_limit
-+
-charging switch currently OFF
-```
-
-rather than requiring Android to report `Charging`.
-
-This allows the intended hysteresis loop to work even while `input_suspend=1`.
-
----
-
-### 6. Temperature recovery cannot bypass the capacity limit
-
-The original logic had two independent controllers:
-
-```text
-capacity controller
-temperature controller
-```
-
-That creates a possible interaction where the temperature controller can decide to re-enable charging after a thermal cooldown even though the battery is already at the configured capacity limit.
-
-The fork prevents that.
-
-Temperature-based recovery is allowed only when:
-
-```text
-capacity < capacity_limit
-```
-
-In other words:
-
-```text
-temperature recovered
-        +
-battery still below charge limit
-        ↓
-charging may resume
-```
-
-but:
-
-```text
-temperature recovered
-        +
-battery already at/above capacity limit
-        ↓
-charging stays suspended
-```
-
----
-
-### 7. Charging-switch confirmation was rewritten
-
-The kernel switch used by this fork is:
+The charging controller operates directly on:
 
 ```text
 /sys/class/qcom-battery/input_suspend
@@ -240,33 +129,191 @@ The kernel switch used by this fork is:
 with:
 
 ```text
-0 = charging enabled
+0 = charging allowed
 1 = charging suspended
 ```
 
-After changing that value, the program does not blindly assume that the hardware state has already followed the write.
-
-The transition is verified using actual battery current.
-
-That is important because:
+The controller therefore behaves as:
 
 ```text
-software switch state
+battery >= capacity_limit
+        +
+input_suspend = 0
+        ↓
+input_suspend = 1
 ```
 
 and:
 
 ```text
-actual current flow
+battery < recharging_limit
+        +
+input_suspend = 1
+        ↓
+input_suspend = 0
 ```
 
-are not necessarily updated at exactly the same instant.
+With the default configuration:
 
-The fork therefore treats the actual current as the useful confirmation signal.
+```text
+capacity_limit  = 50
+recharging_limit = 48
+```
+
+the state machine is:
+
+```text
+50% → STOP
+49% → STOP
+48% → STOP
+47% → RESUME
+```
+
+This hysteresis prevents rapid on/off switching around the limit.
+
+Importantly, this logic is independent of USB presence.
+
+A charger can remain physically connected while:
+
+```text
+input_suspend = 1
+```
+
+and zCharge will keep charging suspended until the battery falls below the recharging threshold.
 
 ---
 
-### 8. Current logging units were corrected
+## 5. Recharging no longer requires a "charger plugged" state
+
+The original implementation maintained an internal charger-plugged state and used battery/USB state to decide whether charging could restart.
+
+This fork removes that dependency.
+
+The actual switch state is read directly from:
+
+```text
+/sys/class/qcom-battery/input_suspend
+```
+
+before the capacity decision is made.
+
+This means zCharge can correctly perform:
+
+```text
+50%
+ ↓
+input_suspend = 1
+ ↓
+charging stops
+ ↓
+battery falls below 48%
+ ↓
+input_suspend = 0
+ ↓
+charging resumes
+```
+
+without requiring a new USB connection event.
+
+---
+
+## 6. Charging-switch verification was rewritten
+
+The original implementation used battery current as part of the logic deciding whether the charging switch transition had succeeded.
+
+That introduced unnecessary coupling between:
+
+```text
+input_suspend
+```
+
+and:
+
+```text
+battery/current_now
+```
+
+The fork now verifies the transition by reading the actual switch value again.
+
+The sequence is:
+
+```text
+write input_suspend
+        ↓
+wait briefly
+        ↓
+read input_suspend again
+        ↓
+confirm requested value
+```
+
+`battery/current_now` is still logged for diagnostics, but it is no longer the authority for deciding whether the switch itself changed successfully.
+
+This is important because the Qualcomm charging stack may take a moment to propagate the new state through the power-supply interfaces.
+
+---
+
+## 7. Fast polling is kept only during switch transitions
+
+The normal control loop runs every 60 seconds.
+
+When zCharge actually changes:
+
+```text
+input_suspend 0 → 1
+```
+
+or:
+
+```text
+input_suspend 1 → 0
+```
+
+it briefly checks the switch state once per second.
+
+This gives fast confirmation without constantly polling the whole charging subsystem every second.
+
+---
+
+## 8. Temperature controller is decoupled from USB state
+
+The temperature controller also works independently from charger presence.
+
+It monitors:
+
+```text
+/sys/class/power_supply/battery/temp
+```
+
+and can suspend charging if the configured temperature limit is exceeded.
+
+Temperature recovery is only allowed to re-enable charging while:
+
+```text
+capacity < capacity_limit
+```
+
+so temperature recovery cannot accidentally bypass the capacity limit.
+
+The current default configuration intentionally uses:
+
+```text
+temperature_limit = 800
+```
+
+which corresponds to:
+
+```text
+80.0°C
+```
+
+The phone/kernel charging stack remains responsible for normal thermal charging management.
+
+The zCharge temperature limit is therefore effectively a high-temperature fallback rather than the primary thermal controller.
+
+---
+
+## 9. Current units fixed
 
 Android exposes:
 
@@ -274,579 +321,303 @@ Android exposes:
 battery/current_now
 ```
 
-in microamps (`µA`).
+in **microamps (µA)**.
 
 Therefore:
 
 ```text
-1503000
+1500000
 ```
 
 means approximately:
 
 ```text
-1.503 A
+1.5 A
 ```
 
 and not:
 
 ```text
-1503 A
+1500 A
 ```
 
 The fork corrected the log messages accordingly.
 
 ---
 
-## Default configuration
+## 10. Configuration is stored in SQLite
 
-The included database is configured for the following defaults:
-
-```text
-enabled = 1
-capacity_limit = 50
-recharging_limit = 48
-
-temperature_limit = 800
-
-charging_switch_path = /sys/class/qcom-battery/input_suspend
-charging_switch_on = 0
-charging_switch_off = 1
-```
-
-### Capacity limits
-
-The normal charging cycle is:
+zCharge uses:
 
 ```text
-battery reaches 50%
-        ↓
-charging suspended
-
-battery falls below 48%
-        ↓
-charging resumed
+/data/adb/zcharge/zcharge.db
 ```
 
-The two values intentionally provide hysteresis so that charging does not repeatedly toggle around one exact percentage.
-
-### Temperature limit
-
-The fork leaves temperature protection effectively to the Android/kernel charging stack rather than using zcharge as the primary thermal controller.
-
-For this reason the bundled configuration uses:
+The default configuration used by this fork is:
 
 ```text
-temperature_limit = 800
+enabled                 = 1
+capacity_limit          = 50
+recharging_limit        = 48
+temperature_limit       = 800
+charging_switch_path    = /sys/class/qcom-battery/input_suspend
+charging_switch_on      = 0
+charging_switch_off     = 1
 ```
 
-which corresponds to 80.0°C in zcharge's own unit convention and effectively keeps zcharge from becoming the active low-temperature thermal limiter.
+The database can be inspected with:
 
-The intention is to avoid duplicating or fighting the device's native Qualcomm/Android thermal charging management.
+```sh
+zcharge --print
+```
 
 ---
 
-## Qualcomm charging switch
+# Usage
 
-This fork is specifically built around:
+```text
+Usage: zcharge [OPTIONS] [ARGS...]
+
+Options:
+
+  --print
+      Print configuration content
+
+  --convert <old_config> <new_config>
+      Convert the old configuration file to the SQLite database format
+
+  --enable [config_db]
+      Enable zcharge with the specified database file (or the default)
+
+  --disable [config_db]
+      Disable zcharge with the specified database file (or the default)
+
+  --reload
+      Tell the running zcharge service to reload the configuration
+
+  --update <key=value> [config_db]
+      Update a configuration value
+
+  -h, --help
+      Show this help message
+```
+
+## Examples
+
+Show current configuration:
+
+```sh
+su -c 'zcharge --print'
+```
+
+Set the charge limit:
+
+```sh
+su -c 'zcharge --update capacity_limit=50'
+```
+
+Set the recharge threshold:
+
+```sh
+su -c 'zcharge --update recharging_limit=48'
+```
+
+Set the high-temperature fallback limit:
+
+```sh
+su -c 'zcharge --update temperature_limit=800'
+```
+
+Reload the running service after changing the configuration:
+
+```sh
+su -c 'zcharge --reload'
+```
+
+Enable the limiter:
+
+```sh
+su -c 'zcharge --enable'
+```
+
+Disable the limiter:
+
+```sh
+su -c 'zcharge --disable'
+```
+
+---
+
+# Important paths
+
+Main executable:
+
+```text
+/system/bin/zcharge
+```
+
+Configuration database:
+
+```text
+/data/adb/zcharge/zcharge.db
+```
+
+PID file:
+
+```text
+/data/adb/zcharge/zcharge.pid
+```
+
+Log:
+
+```text
+/data/adb/zcharge/zcharge.log
+```
+
+Charging switch used by this fork:
 
 ```text
 /sys/class/qcom-battery/input_suspend
 ```
 
-The bundled configuration uses:
+Battery capacity:
 
 ```text
-charging_switch_on = 0
-charging_switch_off = 1
+/sys/class/power_supply/battery/capacity
 ```
 
-Therefore:
+Battery temperature:
 
 ```text
-0 → allow charging
-1 → suspend battery charging
+/sys/class/power_supply/battery/temp
 ```
 
-The exact semantics are device/kernel dependent, so the module should not be assumed to work unchanged on unrelated hardware.
-
----
-
-## Repository structure
-
-The repository contains both the original project components and the additional tooling used by this fork.
+Battery current:
 
 ```text
-zcharge-fix/
-│
-├── .github/
-│   └── workflows/
-│       └── build.yml
-│
-├── MAGISK_MODULE/
-│   ├── readme.md
-│   └── zcharge-magisk-module.zip
-│
-├── META-INF/
-│   └── com/google/android/
-│
-├── sqlite-amalgamation/
-│   ├── sqlite3.c
-│   ├── sqlite3.h
-│   └── ...
-│
-├── system/
-│   └── bin/
-│       ├── zcharge
-│       └── zcharge.cpp
-│
-├── A1_make_configure_sqliteDB.py
-├── A2_make_magisk_module.py
-├── Makefile
-├── README.md
-├── build.sh
-├── customize.sh
-├── module.prop
-├── service.sh
-├── tools.sh
-└── zcharge.db
+/sys/class/power_supply/battery/current_now
 ```
 
 ---
 
-## Source code
+# Repository tools
 
-The main program is:
+The repository also contains two small Python utilities.
+
+## `A1_make_configure_sqliteDB.py`
+
+This script prepares the repository SQLite configuration database.
+
+It:
+
+1. creates a backup of the existing `zcharge.db`
+2. displays the configuration currently stored in the database
+3. inserts missing configuration keys
+4. updates existing keys
+5. writes the resulting configuration back to SQLite
+6. displays the final configuration
+
+The script is intended to make preparation of the database reproducible and avoids manually editing the SQLite file.
+
+The default configuration written by the script should match the configuration expected by this fork:
 
 ```text
-system/bin/zcharge.cpp
+enabled                 = 1
+capacity_limit          = 50
+recharging_limit        = 48
+temperature_limit       = 800
+charging_switch_path    = /sys/class/qcom-battery/input_suspend
+charging_switch_on      = 0
+charging_switch_off     = 1
 ```
 
-The compiled executable is:
+A backup is created as:
 
 ```text
-system/bin/zcharge
-```
-
-SQLite is bundled directly into the repository using the SQLite amalgamation:
-
-```text
-sqlite-amalgamation/libsqlite3.a
-```
-
-The Makefile links that static SQLite library into the executable.
-
----
-
-## Build system
-
-The original project includes a shell build script and Makefile.
-
-The repository Makefile:
-
-* builds `system/bin/zcharge`
-* links the bundled SQLite amalgamation
-* links Android `liblog`
-* expects an Android ARM64 toolchain
-* verifies that the required `libc++_shared.so` is available.
-
-The original `build.sh` also handles version/versionCode updates and packaging through `7za`.
-
-For this fork, compilation is performed through GitHub Actions so a local Android NDK installation is not required.
-
----
-
-## GitHub Actions build
-
-The workflow is:
-
-```text
-.github/workflows/build.yml
-```
-
-It currently:
-
-1. checks out the repository
-2. installs Java 17
-3. installs the required host build tools
-4. installs Android NDK 26.3.11579264
-5. prepares the ARM64 Android toolchain
-6. provides the required `libc++_shared.so`
-7. invokes `make` using the Android ARM64 compiler
-8. adds the SQLite include path
-9. verifies the resulting ELF
-10. uploads the compiled binary as a GitHub Actions artifact.
-
-The compiler target is:
-
-```text
-aarch64-linux-android24
-```
-
-and the resulting executable is verified as:
-
-```text
-ELF 64-bit
-ARM aarch64
-PIE executable
+zcharge.db.backup
 ```
 
 ---
 
-## Windows / source-file handling
+## `A2_make_magisk_module.py`
 
-Part of the reason for keeping the build pipeline explicit is that the source tree is also edited and maintained from Windows.
-
-When source files are copied or modified through Windows tooling, line endings and file representation can occasionally introduce confusing build failures.
-
-The practical approach used in this project is:
-
-```text
-edit / copy source
-        ↓
-keep the repository as the source of truth
-        ↓
-compile on a clean Linux runner
-```
-
-The GitHub Actions runner therefore provides a reproducible Linux build environment instead of relying on whatever compiler/runtime happens to be installed on the Windows machine.
-
-This is also why the build process is kept separate from the Magisk packaging step.
-
----
-
-## SQLite configuration helper
-
-`A1_make_configure_sqliteDB.py` prepares the bundled:
-
-```text
-zcharge.db
-```
-
-The script:
-
-* checks that the database exists
-* creates a backup as `zcharge.db.backup`
-* prints the existing configuration
-* updates the expected configuration keys
-* inserts a key if it does not already exist
-* commits the SQLite transaction
-* prints the resulting configuration.
-
-The current defaults applied by the script are:
-
-```text
-enabled = 1
-capacity_limit = 50
-recharging_limit = 48
-temperature_limit = 800
-charging_switch_path = /sys/class/qcom-battery/input_suspend
-charging_switch_on = 0
-charging_switch_off = 1
-```
-
-This lets the database be rebuilt/configured without manually editing SQLite data.
-
----
-
-## Magisk packaging helper
-
-`A2_make_magisk_module.py` builds:
+This script packages the repository into:
 
 ```text
 zcharge-magisk.zip
 ```
 
-The script creates a temporary staging directory, copies the module files and `system/` tree into it, creates the ZIP, and removes the staging directory afterwards.
+It collects the required Magisk module files, `system/`, `META-INF/`, the SQLite database and other module files into a temporary staging directory and creates the final flashable ZIP.
 
-The packaged components include:
-
-```text
-module.prop
-customize.sh
-service.sh
-tools.sh
-zcharge.db
-system/
-META-INF/
-```
-
-Missing optional files are skipped rather than causing the entire packaging operation to fail.
+This avoids manually creating the Magisk package from Windows Explorer and helps prevent accidental omissions or path/layout errors.
 
 ---
 
-## Runtime service
+# Build
 
-`service.sh` starts the zcharge executable through Magisk's service mechanism and redirects its output into the zcharge log environment. It also starts a filtered `logcat` stream for the `zcharge` tag.
+The project contains a Makefile and the SQLite amalgamation required for building the binary.
 
-The runtime files are stored under:
-
-```text
-/data/adb/zcharge/
-```
-
-including:
+The GitHub Actions workflow builds the project using:
 
 ```text
-/data/adb/zcharge/zcharge.db
-/data/adb/zcharge/zcharge.log
-/data/adb/zcharge/zcharge.pid
+Android NDK 26.3.11579264
 ```
+
+and the Android AArch64 compiler:
+
+```text
+aarch64-linux-android24-clang++
+```
+
+The resulting binary is:
+
+```text
+ELF 64-bit
+ARM aarch64
+```
+
+The workflow also checks the SQLite include path explicitly before compiling.
 
 ---
 
-## Runtime configuration
+# Why this fork exists
 
-The zcharge binary provides the following command-line operations:
+The main reason for this fork is not to add another charging feature.
+
+It is to make the existing limiter behave like a simple state machine instead of trying to reconstruct the entire Android charging subsystem.
+
+The intended logic is:
 
 ```text
-zcharge [OPTIONS] [ARGS...]
-
-Options:
-
-  --print
-      Print configuration.
-
-  --convert <old_config> <new_config>
-      Convert an old configuration file to the SQLite format.
-
-  --enable [config_db]
-      Enable zcharge and start the service.
-
-  --disable [config_db]
-      Disable zcharge.
-
-  --reload
-      Tell the running zcharge process to reload its configuration.
-
-  --update <key=value> [config_db]
-      Update a configuration value.
-
-  -h, --help
-      Show help.
+                    battery capacity
+                           │
+              ┌────────────┴────────────┐
+              │                         │
+           >= 50%                    < 48%
+              │                         │
+              ▼                         ▼
+      input_suspend = 1         input_suspend = 0
+              │                         │
+              ▼                         ▼
+       charging suspended         charging allowed
 ```
 
-The command set comes from the upstream zcharge interface and remains available in this fork.
+USB connection state and Android's human-readable charging status are intentionally outside that decision.
+
+That makes the limiter much less sensitive to Qualcomm/Android power-supply state reporting quirks.
 
 ---
 
-## Example commands
+# Disclaimer
 
-Print the active configuration:
-
-```sh
-su -c '/data/adb/modules/zcharge/system/bin/zcharge --print'
-```
-
-Reload configuration after changing the database:
-
-```sh
-su -c '/data/adb/modules/zcharge/system/bin/zcharge --reload'
-```
-
-Update a configuration value:
-
-```sh
-su -c '/data/adb/modules/zcharge/system/bin/zcharge --update capacity_limit=50'
-```
-
-Disable zcharge:
-
-```sh
-su -c '/data/adb/modules/zcharge/system/bin/zcharge --disable'
-```
-
-Enable zcharge:
-
-```sh
-su -c '/data/adb/modules/zcharge/system/bin/zcharge --enable'
-```
-
----
-
-## Useful runtime checks
-
-USB charger presence:
-
-```sh
-su -c 'cat /sys/class/power_supply/usb/online'
-```
-
-USB current:
-
-```sh
-su -c 'cat /sys/class/power_supply/usb/current_now'
-```
-
-Battery current:
-
-```sh
-su -c 'cat /sys/class/power_supply/battery/current_now'
-```
-
-Battery temperature:
-
-```sh
-su -c 'cat /sys/class/power_supply/battery/temp'
-```
-
-Battery status:
-
-```sh
-su -c 'cat /sys/class/power_supply/battery/status'
-```
-
-Charging switch:
-
-```sh
-su -c 'cat /sys/class/qcom-battery/input_suspend'
-```
-
-Running zcharge process:
-
-```sh
-su -c 'pgrep -af zcharge'
-```
-
-Recent zcharge log:
-
-```sh
-su -c 'tail -30 /data/adb/zcharge/zcharge.log'
-```
-
----
-
-## Expected charging states
-
-With a charger physically connected and normal charging:
-
-```text
-usb/online       = 1
-input_suspend    = 0
-battery/status   = Charging
-battery/current  < 0
-```
-
-After reaching the configured capacity limit:
-
-```text
-usb/online       = 1
-input_suspend    = 1
-battery/status   = Discharging
-battery/current  >= 0
-```
-
-The important point is that the second state does **not** mean that the USB charger was unplugged.
-
-It means:
-
-```text
-USB still connected
-        +
-charging intentionally suspended
-```
-
-This distinction is the main reason for the charging-state rewrite in this fork.
-
----
-
-## Current flow example
-
-A typical charging measurement may look like:
-
-```text
-usb/current_now     = 1503000
-battery/current_now = -1253069
-```
-
-which is approximately:
-
-```text
-USB input       ≈ 1.50 A
-battery charge  ≈ 1.25 A
-```
-
-The remaining input power is consumed by the phone itself and by conversion losses, so the two current readings are not expected to be identical.
-
----
-
-## Scope of this fork
-
-This fork does **not** attempt to redesign Android's entire charging stack.
-
-The goal is narrower:
-
-```text
-keep the original zcharge concept
-            +
-fix Qualcomm charging-state behaviour
-            +
-remove pointless 1 Hz polling
-            +
-keep charging-limit hysteresis reliable
-```
-
-The device's own charging, thermal and power-management systems remain responsible for their normal hardware protections.
-
----
-
-## Prebuilt module
-
-A prebuilt Magisk package is also kept under:
-
-```text
-MAGISK_MODULE/
-```
-
-for convenience.
-
-For development, the preferred path is to build the current source rather than assuming that the prebuilt ZIP corresponds to the latest commit.
-
----
-
-## Credits
-
-Original project:
-
-**lululoid/zcharge**
-
-This repository is a fork containing device-specific fixes and build/configuration tooling.
-
-Original project description:
-
-> Simple module to limit charging capacity.
-
-The upstream project was written as a small C++ experiment and uses SQLite for persistent configuration. The fork keeps that architecture while changing the parts that proved unreliable on the target Qualcomm environment.
-
----
-
-## Disclaimer
-
-This module writes directly to kernel power-supply interfaces and is intended for rooted Android devices.
-
-The exact behaviour of:
+This module writes directly to a kernel charging-control interface:
 
 ```text
 /sys/class/qcom-battery/input_suspend
 ```
 
-depends on the device kernel and vendor charging implementation.
+Behavior depends on the device kernel and power-management implementation.
 
-Do not assume that the same switch semantics or power-supply paths exist on unrelated devices.
+This fork was developed and tested primarily around a Qualcomm-based device where the above interface is available.
 
-Always verify the relevant `/sys/class/power_supply/` and Qualcomm charging interfaces on the target device before deploying the module.
-
----
-
-## License / upstream history
-
-This repository is derived from the upstream:
-
-```text
-https://github.com/lululoid/zcharge
-```
-
-See the upstream project and repository history for the original implementation and licensing information.
-
-```
-```
+Do not assume that the same charging-switch path exists on other devices.
