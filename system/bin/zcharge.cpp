@@ -22,7 +22,7 @@ using namespace std;
 #define ALOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define ALOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 
-string on_switch, off_switch, switch_, charging_switch_path,
+string on_switch, off_switch, charging_switch_path,
     charging_switch_value, db_file;
 int current_now;
 bool enabled, thread_success = false;
@@ -193,17 +193,6 @@ int read_capacity() {
   return capacity;
 }
 
-int read_usb_online() {
-  ifstream file("/sys/class/power_supply/usb/online");
-  if (!file.is_open()) {
-    ALOGE("Failed to open USB online file");
-    return -1;
-  }
-  int online;
-  file >> online;
-  return online;
-}
-
 int read_current_now() {
   string file_path = "/sys/class/power_supply/battery/current_now";
   ifstream file(file_path);
@@ -214,24 +203,6 @@ int read_current_now() {
   int current_now;
   file >> current_now;
   return current_now;
-}
-
-string check_sign(int num) {
-  if (num > 0) {
-    return "+";
-  } else if (num < 0) {
-    return "-";
-  } else if (num == 0) {
-    return "0";
-  } else {
-    return "";
-  }
-}
-
-bool is_charging() {
-  current_now = read_current_now();
-  string sign = check_sign(current_now);
-  return (charging_switch_value == on_switch && sign == "-");
 }
 
 void write_charging_switch(const string &value) {
@@ -327,9 +298,8 @@ void limiter_service(const string &db_file) {
 
   // Initial configuration load
   int recharging_limit, capacity_limit, temp_limit, temperature;
-  bool plugged = false, notified = false, cooldown = true, cooling_off = false;
+  bool cooldown = true, cooling_off = false;
   string sql = "SELECT key, value FROM zcharge_config";
-  string bc_switch_value;
   sqlite3_stmt *stmt;
 
   auto load_config = [&]() {
@@ -378,14 +348,15 @@ void limiter_service(const string &db_file) {
       if (reload_config) {
         ALOGI("Reloading configuration...");
         reload_config = 0;
+
         if (sqlite3_open(db_file.c_str(), &db)) {
           ALOGE("Can't reopen database: %s", sqlite3_errmsg(db));
-          continue; // Skip this iteration if reopening fails
+          continue;
         }
 
         load_config();
         sqlite3_close(db);
-        continue; // Restart the loop with new config
+        continue;
       }
 
       int capacity = read_capacity();
@@ -395,83 +366,87 @@ void limiter_service(const string &db_file) {
         continue;
       }
 
-      int usb_online = read_usb_online();
-      if (usb_online == -1) {
-        ALOGE("Failed to read USB online state");
-        this_thread::sleep_for(chrono::seconds(1));
-        continue;
+      // Read the actual charging switch state.
+      charging_switch_value =
+          get_value_from_charging_switch(charging_switch_path);
+
+      // ------------------------------------------------------------
+      // Capacity controller
+      //
+      // ON  (0)  = charging allowed
+      // OFF (1)  = charging suspended
+      //
+      // 50% -> suspend charging
+      // <48% -> resume charging
+      // ------------------------------------------------------------
+
+      if (capacity >= capacity_limit &&
+          charging_switch_value == on_switch) {
+
+        ALOGI("Capacity limit reached (%d%%)", capacity_limit);
+
+        notif("Capacity limit reached(%d%%), stopping charging...", capacity);
+
+        set_charging_switch(off_switch);
+
+        cooldown = true;
+
+        ALOGI("Cooldown to %d%% before recharging again", recharging_limit);
+
+      } else if (capacity < recharging_limit &&
+                 cooldown &&
+                 charging_switch_value == off_switch) {
+
+        ALOGI("Battery level(%d%%) is below recharging limit(%d%%)",
+              capacity, recharging_limit);
+
+        set_charging_switch(on_switch);
+
+        cooldown = false;
+        cooling_off = false;
       }
 
-      bool charger_present = (usb_online == 1);
+      // ------------------------------------------------------------
+      // Temperature controller
+      //
+      // Kept independent from USB presence.
+      // The configured value is normally 800 (80°C), so it does
+      // not normally intervene.
+      // ------------------------------------------------------------
 
-      if (charger_present) {
-        charging_switch_value =
-            get_value_from_charging_switch(charging_switch_path);
+      temperature = read_bat_temp();
 
-        if (!plugged) {
-          ALOGI("Charger plugged");
-          plugged = true;
-        }
+      if (temperature > temp_limit &&
+          charging_switch_value == on_switch) {
 
-        // Re-enable charging after cooldown.
-        if (capacity < recharging_limit && cooldown &&
-            charging_switch_value == off_switch) {
-          ALOGI("Battery level(%d%%) is below recharging limit(%d%%)",
-                capacity, recharging_limit);
-          set_charging_switch(on_switch);
-          cooldown = false;
-          cooling_off = false;
-        }
+        ALOGI("Temperature(%.1f°C) exceed limit(%.1f°C)",
+              temperature / 10.0,
+              temp_limit / 10.0);
 
-        // Charging controller
-        if (capacity >= capacity_limit && is_charging()) {
-          ALOGI("Capacity limit reached (%d%%)", capacity_limit);
-          notif("Capacity limit reached(%d%%), stopping charging...", capacity);
-          set_charging_switch(off_switch);
-          cooldown = true;
-          ALOGI("Cooldown to %d%% before recharging again", recharging_limit);
-        }
+        set_charging_switch(off_switch);
 
-        // Temperature controller
-        temperature = read_bat_temp();
-        if (temperature > temp_limit &&
-            charging_switch_value == on_switch) {
-          ALOGI("Temperature(%.1f°C) exceed limit(%.1f°C)",
-                temperature / 10.0, temp_limit / 10.0);
-          set_charging_switch(off_switch);
-          cooling_off = true;
-        } else if (temperature < temp_limit &&
-                   cooling_off &&
-                   charging_switch_value == off_switch &&
-                   capacity < capacity_limit) {
-          ALOGI("Temperature is back to normal(%.1f°C), turning on charging...",
-                temp_limit / 10.0);
-          set_charging_switch(on_switch);
-          cooling_off = false;
-        }
-      }
+        cooling_off = true;
 
-      if (!charger_present) {
-        if (plugged) {
-          ALOGI("Charger unplugged");
-          plugged = false;
-        }
+      } else if (temperature < temp_limit &&
+                 cooling_off &&
+                 charging_switch_value == off_switch &&
+                 capacity < capacity_limit) {
 
-        if (!notified && capacity == 30) {
-          notif(
-              "Battery is %d%%, charge your phone to increase battery lifespan",
-              capacity);
-          notified = true;
-        } else if (notified && capacity != 30) {
-          notified = false;
-        }
+        ALOGI("Temperature is back to normal(%.1f°C), turning on charging...",
+              temp_limit / 10.0);
+
+        set_charging_switch(on_switch);
+
+        cooling_off = false;
       }
 
       if (!thread_success) {
         notif("zcharge started successfully.");
         thread_success = true;
       }
-      this_thread::sleep_for(chrono::seconds(MAIN_LOOP_INTERVAL_SECONDS));
+
+      this_thread::sleep_for(
+          chrono::seconds(MAIN_LOOP_INTERVAL_SECONDS));
     }
   } catch (const exception &e) {
     ALOGE("Exception in limiter_service: %s", e.what());
